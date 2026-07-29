@@ -5,13 +5,13 @@ use console::style;
 use eyre::{eyre, Result};
 use futures::stream::StreamExt;
 use reqwest::Client;
-use tokio::task::JoinHandle;
 use std::sync::Arc;
 use std::{fs, path::PathBuf};
 use std::{
     fs::File,
     io::{self, ErrorKind, Write},
 };
+use tokio::task::JoinHandle;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::Semaphore;
@@ -150,17 +150,12 @@ pub fn handle_token(
         // pb.set_position(i);
         let result = match download_image(&client, &url, &file_path, &pb).await {
             Ok(()) => {
-                pb.set_prefix(format!(
-                    "{}",
-                    style("SAVED").fg(console::Color::Green)));
+                pb.set_prefix(format!("{}", style("SAVED").fg(console::Color::Green)));
                 pb.finish_with_message(format!("{name}"));
                 Ok(())
             }
             Err(error) => {
-                pb.set_prefix(format!(
-                    "{}",
-                    style("FAILED").fg(console::Color::Red)
-                ));
+                pb.set_prefix(format!("{}", style("FAILED").fg(console::Color::Red)));
                 pb.abandon_with_message(format!("{name}.{extension}: {error}"));
                 Err(eyre::eyre!("Error downloading image {}: {}", name, error))
             }

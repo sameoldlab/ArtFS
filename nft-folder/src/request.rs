@@ -231,3 +231,54 @@ pub async fn handle_processing(
 
     Ok(())
 }
+
+/// Save an already-fetched batch of tokens
+pub async fn save_tokens(
+    client: &Client,
+    tokens: Vec<NftToken>,
+    path: PathBuf,
+    max: usize,
+) -> eyre::Result<()> {
+    let mp = MultiProgress::new();
+    mp.set_alignment(indicatif::MultiProgressAlignment::Bottom);
+    let total_pb = mp.add(ProgressBar::new(tokens.len() as u64));
+    total_pb.set_style(
+        ProgressStyle::with_template("Found: {len:>3.bold.blue}  Saved: {pos:>3.bold.blue} {msg}")
+            .unwrap(),
+    );
+
+    let semaphore = Arc::new(Semaphore::new(max));
+    let mut errors: Vec<Report> = vec![];
+    let mut set = JoinSet::new();
+
+    for token in tokens {
+        match handle_token(Arc::clone(&semaphore), token, client, &mp, &path) {
+            Ok(Some(task)) => {
+                set.spawn(task);
+            }
+            Ok(None) => total_pb.inc(1),
+            Err(err) => errors.push(err),
+        }
+    }
+
+    while let Some(tasks) = set.join_next().await {
+        let tasks = tasks.unwrap();
+        match tasks.unwrap() {
+            Ok(_) => {
+                total_pb.inc(1);
+            }
+            Err(err) => {
+                errors.push(err);
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        total_pb.finish_with_message("Completed all sucessfully");
+    } else {
+        total_pb.abandon();
+        errors.iter().for_each(|e| println!("{}", e))
+    }
+
+    Ok(())
+}

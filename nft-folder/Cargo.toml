@@ -16,8 +16,7 @@ base64 = "0.13.0"
 console = {version = "0.15.8", features = ["ansi-parsing"]}
 clap = {version = "4.5.2", features = ["derive"]}
 eyre = "0.6.12"
-ethers = { version = "2.0", features = ["rustls"] }
-ethers-providers = { version = "2.0.14", features = ["rustls"] }
+alloy = {version = "1.0", features = ["provider-http", "reqwest", "ens"] }
 futures = {version = "0.3.30" }
 indicatif = {version = "0.17.8", features = ["futures", "tokio", ]}
 reqwest = { version = "0.11", features = ["json", "blocking", "stream"] }

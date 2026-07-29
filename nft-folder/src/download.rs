@@ -128,7 +128,7 @@ pub fn handle_token(
         let hash = url
             .split('/')
             .into_iter()
-            .find(|&part| part.starts_with("Qm"));
+            .find(|&part| part.starts_with("Qm") || part.starts_with('b'));
 
         match hash {
             Some(hash) => format!("https://ipfs.io/ipfs/{}", hash),

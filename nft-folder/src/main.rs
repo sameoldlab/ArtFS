@@ -25,11 +25,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Create a folder for the provided address
-    Create(CreateArgs),
+    Sync(SyncArgs),
 }
 
 #[derive(Args)]
-struct CreateArgs {
+struct SyncArgs {
     /// Address as ENS Name or hex (0x1Bca23...)
     address: String,
 
@@ -55,7 +55,7 @@ struct Account {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Create(args) => {
+        Commands::Sync(args) => {
             let multi_pb = MultiProgress::new();
             let provider = Provider::<Http>::try_from(args.rpc)?;
             let account = match args.address {

@@ -5,7 +5,6 @@ mod download;
 mod helius;
 mod opensea;
 mod tzkt;
-mod zora;
 
 use chain::Chain;
 use collection::CollectionState;
@@ -59,7 +58,7 @@ struct SyncArgs {
     #[arg(long)]
     chain: Option<Chain>,
 
-    /// Data source for EVM chains. Options: zora, alchemy, opensea. Defaults to opensea
+    /// Data source for EVM chains. Options: alchemy, opensea. Defaults to opensea
     #[arg(long, default_value = "opensea")]
     source: EvmSource,
 
@@ -81,7 +80,6 @@ struct SyncArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum EvmSource {
-    Zora,
     Alchemy,
     OpenSea,
 }
@@ -180,8 +178,6 @@ async fn main() -> Result<()> {
             let client = Client::new();
 
             let source_label = match chain {
-                Chain::Ethereum => match args.source {
-                    EvmSource::Zora => "zora",
                     EvmSource::Alchemy => "alchemy",
                     EvmSource::OpenSea => "opensea",
                 },
@@ -197,8 +193,6 @@ async fn main() -> Result<()> {
                 format!("Fetching item list from {source_label}..."),
             );
             let listed: Vec<collection::Item> = match chain {
-                Chain::Ethereum => match args.source {
-                    EvmSource::Zora => zora::list_items(&client, &account.address).await?,
                     EvmSource::Alchemy => {
                         let api_key = args
                             .api_key

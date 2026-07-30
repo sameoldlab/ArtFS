@@ -2,6 +2,8 @@ mod alchemy;
 mod chain;
 mod collection;
 mod download;
+mod helius;
+mod opensea;
 mod tzkt;
 mod zora;
 
@@ -57,7 +59,7 @@ struct SyncArgs {
     #[arg(long)]
     chain: Option<Chain>,
 
-    /// Data source for EVM chains. Options: zora, alchemy, opensea. Defaults to opense
+    /// Data source for EVM chains. Options: zora, alchemy, opensea. Defaults to opensea
     #[arg(long, default_value = "opensea")]
     source: EvmSource,
 
@@ -81,6 +83,7 @@ struct SyncArgs {
 enum EvmSource {
     Zora,
     Alchemy,
+    OpenSea,
 }
 
 struct Account {
@@ -98,20 +101,19 @@ async fn main() -> Result<()> {
 
             let account = match chain {
                 Chain::Tezos => {
-                    if !(args.address.starts_with("tz1")
-                        || args.address.starts_with("tz2")
-                        || args.address.starts_with("tz3")
-                        || args.address.starts_with("KT1"))
-                    {
+                    if !chain::is_tezos(&args.address) {
                         // TODO: Tezos names?
                         return Err(eyre::eyre!(
                             "{} Tezos addresses must start with tz1, tz2, tz3, or KT1",
                             style("Invalid address").red()
                         ));
                     }
+                    if args.address.ends_with(".tez") {
+                        return Err(eyre::eyre!("Tezos names are not yet supported"));
+                    }
                     Account {
                         name: None,
-                        address: args.address.clone(),
+                        address: args.address,
                     }
                 }
                 Chain::Ethereum => match args.address.as_str() {
@@ -128,7 +130,7 @@ async fn main() -> Result<()> {
                     }
                     arg if arg.starts_with("0x") => Account {
                         name: None,
-                        address: arg.to_string(),
+                        address: args.address,
                     },
                     _ => {
                         return Err(eyre::eyre!(
@@ -137,6 +139,21 @@ async fn main() -> Result<()> {
                         ))
                     }
                 },
+                Chain::Solana => {
+                    if !chain::is_solana(&args.address) {
+                        return Err(eyre::eyre!(
+                            "{} Not a valid Solana address",
+                            style("Invalid address").red()
+                        ));
+                    }
+                    if args.address.ends_with(".sol") {
+                        return Err(eyre::eyre!("Solana Name Service is not yet supported"));
+                    }
+                    Account {
+                        name: None,
+                        address: args.address,
+                    }
+                }
             };
 
             let mut path = args
@@ -166,8 +183,10 @@ async fn main() -> Result<()> {
                 Chain::Ethereum => match args.source {
                     EvmSource::Zora => "zora",
                     EvmSource::Alchemy => "alchemy",
+                    EvmSource::OpenSea => "opensea",
                 },
                 Chain::Tezos => "tzkt",
+                Chain::Solana => "helius",
             };
 
             let mut state =
@@ -186,14 +205,39 @@ async fn main() -> Result<()> {
                             .or_else(|| std::env::var("ALCHEMY_API_KEY").ok())
                             .ok_or_else(|| {
                                 eyre::eyre!(
-                                    "{} Pass --api-key or set ALCHEMY_API_KEY to use --source alchemy",
+                                    "{} Pass --api-key or set ALCHEMY_API_KEY to use this source ",
                                     style("Missing API key").red()
                                 )
                             })?;
                         alchemy::list_items(&client, &api_key, &account.address).await?
                     }
+                    EvmSource::OpenSea => {
+                        let api_key = args
+                            .api_key
+                            .or_else(|| std::env::var("OPENSEA_API_KEY").ok())
+                            .ok_or_else(|| {
+                                eyre::eyre!(
+                                    "{} Pass --api-key or set OPENSEA_API_KEY to use this source",
+                                    style("Missing API key").red()
+                                )
+                            })?;
+                        opensea::list_items(&client, &api_key, &account.address).await?
+                    }
                 },
                 Chain::Tezos => tzkt::list_items(&client, &account.address).await?,
+                Chain::Solana => {
+                    let api_key = args
+                        .api_key
+                        .or_else(|| std::env::var("HELIUS_API_KEY").ok())
+                        .ok_or_else(|| {
+                            eyre::eyre!(
+                                "{} Pass --api-key or set HELIUS_API_KEY to use this source ",
+                                style("Missing API key").red()
+                            )
+                        })?;
+
+                    helius::list_items(&client, &api_key, &account.address).await?
+                }
             };
             spinner.finish_with_message(format!("Found {} items", listed.len()));
 

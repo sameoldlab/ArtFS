@@ -1,8 +1,8 @@
-use crate::request::{NftImage, NftToken};
+use crate::collection::Item;
 
 use base64::decode;
 use console::style;
-use eyre::{eyre, Result};
+use eyre::{eyre, Report, Result};
 use futures::stream::StreamExt;
 use reqwest::Client;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::{
     fs::File,
     io::{self, ErrorKind, Write},
 };
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::Semaphore;
@@ -27,34 +27,31 @@ fn pb_style(template: &str) -> ProgressStyle {
         .tick_strings(&["⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶", "⣿"])
 }
 
+/// Outcome of handling one item, synchronously known before any async
+/// download starts.
+pub enum SaveOutcome {
+    /// File already existed on disk; nothing written this run.
+    AlreadySaved(String),
+    /// Written synchronously (e.g. inline base64 SVG) with no network fetch.
+    SavedInstantly(String),
+    /// A background download task was spawned; await the handle for the
+    /// final Result<file_name>.
+    Spawned(JoinHandle<Result<String>>),
+}
+
+/// Save a single selected item to disk.
 pub fn handle_token(
     semaphore: Arc<Semaphore>,
-    token: NftToken,
+    item: Item,
     client: &Client,
     mp: &MultiProgress,
     dir: &PathBuf,
-) -> Result<Option<JoinHandle<Result<()>>>> {
-    // let debug_style = ProgressStyle::with_template("{wide_msg}").unwrap();
+) -> Result<SaveOutcome> {
+    let name = item.name.replace("/", " ").replace("\\", " ");
 
-    let image = token.image;
-    let name = if let Some(name) = token.name {
-        name
-    } else if let (Some(collection_name), Some(id)) = (&token.collection_name, &token.token_id) {
-        format!("{} #{}", collection_name, id)
-    } else {
-        return Err(eyre!("Image data not found for {:#?}", token.token_id));
-    }
-    .replace("/", " ")
-    .replace("\\", " ");
-
-    let (url, mime) = match image {
-        NftImage::Object {
-            url,
-            mime_type,
-            size: _,
-        } => (url, mime_type),
-        NftImage::Url(url) => (url, None),
-        _ => return Err(eyre!("No image URL found for {name}")),
+    let (url, mime) = match item.image_url {
+        Some(url) => (url, item.mime_type),
+        None => return Err(eyre!("No image URL found for {name}")),
     };
     let extension = if url.starts_with("data:image/svg") {
         "svg".to_string()
@@ -79,7 +76,8 @@ pub fn handle_token(
     // TODO: Maybe panic automatically on unrecognized file types
     // TODO: Some SVGs seem to be having issues
 
-    let file_path = dir.join(format!("{name}.{extension}"));
+    let file_name = format!("{name}.{extension}");
+    let file_path = dir.join(&file_name);
     let msg = name.clone();
 
     // TODO: Does not verify if file was saved correctly. Will skip over partially downloaded files
@@ -92,7 +90,7 @@ pub fn handle_token(
         );
         pb.set_prefix("SKIPPED");
         pb.finish_with_message(format!("{name}"));
-        return Ok(None);
+        return Ok(SaveOutcome::AlreadySaved(file_name));
     }
     // SVG is included in response. Save and return
     if url.starts_with("data:image/svg") {
@@ -109,7 +107,7 @@ pub fn handle_token(
         )?;
         pb.set_prefix("SAVED");
         pb.finish();
-        return Ok(None);
+        return Ok(SaveOutcome::SavedInstantly(file_name));
     }
 
     if DEBUG {
@@ -152,7 +150,7 @@ pub fn handle_token(
             Ok(()) => {
                 pb.set_prefix(format!("{}", style("SAVED").fg(console::Color::Green)));
                 pb.finish_with_message(format!("{name}"));
-                Ok(())
+                Ok(file_name)
             }
             Err(error) => {
                 pb.set_prefix(format!("{}", style("FAILED").fg(console::Color::Red)));
@@ -164,7 +162,7 @@ pub fn handle_token(
         drop(permit);
         result
     });
-    Ok(Some(handle))
+    Ok(SaveOutcome::Spawned(handle))
 }
 
 async fn download_image(
@@ -237,4 +235,69 @@ mod tests {
         assert_eq!(result, "0x");
     }
         */
+}
+
+/// Save a batch of already-selected items to disk. Returns a list of
+/// (item_id, file_name) for everything successfully saved or already present
+/// on disk, so the caller can update the collection manifest accordingly.
+/// Errors for individual items are printed but don't abort the batch.
+pub async fn save_items(
+    client: &Client,
+    items: Vec<(String, crate::collection::Item)>,
+    path: PathBuf,
+    max: usize,
+) -> eyre::Result<Vec<(String, String)>> {
+    use crate::download::SaveOutcome;
+
+    let mp = MultiProgress::new();
+    mp.set_alignment(indicatif::MultiProgressAlignment::Bottom);
+    let total_pb = mp.add(ProgressBar::new(items.len() as u64));
+    total_pb.set_style(
+        ProgressStyle::with_template("Found: {len:>3.bold.blue}  Saved: {pos:>3.bold.blue} {msg}")
+            .unwrap(),
+    );
+
+    let semaphore = Arc::new(Semaphore::new(max));
+    let mut errors: Vec<Report> = vec![];
+    let mut saved: Vec<(String, String)> = vec![];
+    let mut set: JoinSet<(String, Result<String>)> = JoinSet::new();
+
+    for (id, item) in items {
+        match handle_token(Arc::clone(&semaphore), item, client, &mp, &path) {
+            Ok(SaveOutcome::AlreadySaved(file_name))
+            | Ok(SaveOutcome::SavedInstantly(file_name)) => {
+                total_pb.inc(1);
+                saved.push((id, file_name));
+            }
+            Ok(SaveOutcome::Spawned(handle)) => {
+                set.spawn(async move {
+                    let result = handle
+                        .await
+                        .unwrap_or_else(|err| Err(eyre!("Download task panicked: {err}")));
+                    (id, result)
+                });
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+
+    while let Some(res) = set.join_next().await {
+        let (id, result) = res.unwrap();
+        match result {
+            Ok(file_name) => {
+                total_pb.inc(1);
+                saved.push((id, file_name));
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+
+    if errors.is_empty() {
+        total_pb.finish_with_message("Completed all sucessfully");
+    } else {
+        total_pb.abandon();
+        errors.iter().for_each(|e| println!("{}", e))
+    }
+
+    Ok(saved)
 }

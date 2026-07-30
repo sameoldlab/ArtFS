@@ -2,8 +2,7 @@ use eyre::{eyre, Result};
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::chain::make_token;
-use crate::request::NftToken;
+use crate::collection::Item;
 
 const BASE_URL: &str = "https://eth-mainnet.g.alchemy.com/nft/v3";
 /// Max allowed by Alchemy's API.
@@ -28,6 +27,7 @@ struct AlchemyNft {
 
 #[derive(Deserialize, Debug)]
 struct AlchemyContract {
+    address: String,
     name: Option<String>,
     #[serde(rename = "openSeaMetadata")]
     open_sea_metadata: Option<AlchemyOpenSeaMetadata>,
@@ -47,9 +47,11 @@ struct AlchemyImage {
     original_url: Option<String>,
     #[serde(rename = "contentType")]
     content_type: Option<String>,
+    size: Option<u64>,
 }
 
-pub async fn fetch_all(client: &Client, api_key: &str, address: &str) -> Result<Vec<NftToken>> {
+/// List every NFT owned by `address` on Ethereum mainnet via Alchemy API
+pub async fn list_items(client: &Client, api_key: &str, address: &str) -> Result<Vec<Item>> {
     let mut all = Vec::new();
     let mut page_key: Option<String> = None;
 
@@ -84,15 +86,25 @@ pub async fn fetch_all(client: &Client, api_key: &str, address: &str) -> Result<
                 .contract
                 .open_sea_metadata
                 .and_then(|m| m.collection_name)
-                .or(nft.contract.name);
+                .or_else(|| nft.contract.name.clone());
 
-            all.push(make_token(
-                image_url,
-                nft.image.content_type,
-                nft.name,
+            let id = format!("{}:{}", nft.contract.address, nft.token_id);
+            let name = nft.name.clone().unwrap_or_else(|| {
+                format!(
+                    "{} #{}",
+                    collection_name.clone().unwrap_or_default(),
+                    nft.token_id
+                )
+            });
+
+            all.push(Item {
+                id,
+                name,
                 collection_name,
-                Some(nft.token_id),
-            ));
+                image_url,
+                mime_type: nft.image.content_type,
+                size_bytes: nft.image.size,
+            });
         }
 
         match parsed.page_key {

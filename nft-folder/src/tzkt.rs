@@ -2,8 +2,7 @@ use eyre::{eyre, Result};
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::chain::make_token;
-use crate::request::NftToken;
+use crate::collection::Item;
 
 const BASE_URL: &str = "https://api.tzkt.io/v1/tokens/balances";
 const PAGE_LIMIT: u32 = 200;
@@ -46,7 +45,9 @@ struct TzktFormat {
     mime_type: Option<String>,
 }
 
-pub async fn fetch_all(client: &Client, address: &str) -> Result<Vec<NftToken>> {
+//  TzKT/TZIP-21 metadata doesn't reliably expose a file size field, so
+// `Item::size_bytes` is always None here
+pub async fn list_items(client: &Client, address: &str) -> Result<Vec<Item>> {
     let mut all = Vec::new();
     let mut offset: u32 = 0;
 
@@ -60,7 +61,6 @@ pub async fn fetch_all(client: &Client, address: &str) -> Result<Vec<NftToken>> 
             .send()
             .await
             .map_err(|err| eyre!("Failed to reach TzKT: {err}"))?;
-
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -78,11 +78,12 @@ pub async fn fetch_all(client: &Client, address: &str) -> Result<Vec<NftToken>> 
         }
 
         for item in batch {
+            let contract_address = item.token.contract.address.clone();
             let contract_name = item
                 .token
                 .contract
                 .alias
-                .unwrap_or(item.token.contract.address);
+                .unwrap_or_else(|| contract_address.clone());
 
             let (name, image_url, mime_type) = match item.token.metadata {
                 Some(meta) => {
@@ -112,13 +113,19 @@ pub async fn fetch_all(client: &Client, address: &str) -> Result<Vec<NftToken>> 
                 None => (None, None, None),
             };
 
-            all.push(make_token(
-                normalize_ipfs_uri(image_url),
+            let id = format!("{}:{}", contract_address, item.token.token_id);
+            let display_name = name
+                .clone()
+                .unwrap_or_else(|| format!("{} #{}", contract_name, item.token.token_id));
+
+            all.push(Item {
+                id,
+                name: display_name,
+                collection_name: Some(contract_name),
+                image_url: normalize_ipfs_uri(image_url),
                 mime_type,
-                name,
-                Some(contract_name),
-                Some(item.token.token_id),
-            ));
+                size_bytes: None,
+            });
         }
 
         if (count as u32) < PAGE_LIMIT {

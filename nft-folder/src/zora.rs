@@ -1,6 +1,6 @@
 use crate::download::handle_token;
 use eyre::{eyre, Report, Result};
-use futures::{stream, StreamExt};
+use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
@@ -157,91 +157,76 @@ pub async fn fetch_page(
     }
 }
 
-pub async fn handle_processing(
+/// List every NFT owned by `address` via Zora's GraphQL API, fully paginating.
+/// Does not download anything. Zora tokens don't carry a contract address in
+/// this schema, so ids fall back to "<collection_name>:<token_id>".
+pub async fn list_items(
     client: &Client,
     address: &str,
-    path: PathBuf,
-    max: usize,
-) -> eyre::Result<()> {
-    let cursor = None;
-    let requests = stream::unfold(cursor, move |cursor| async move {
-        match fetch_page(&client, cursor, address).await {
-            Ok(Some(response)) => {
-                if !response.nodes.is_empty() {
-                    let items = stream::iter(response.nodes.into_iter().map(|node| node.token));
-                    let next_cursor = response.page_info.end_cursor;
-                    // Max 30 requests per min to public Zora API, but doesn't kick in below 6000 (30*200) tokens
-                    // std::thread::sleep(std::time::Duration::from_millis(2000));
-                    Some((items, next_cursor))
-                } else {
-                    None
+) -> eyre::Result<Vec<crate::collection::Item>> {
+    let mut items = Vec::new();
+    let mut cursor = None;
+
+    loop {
+        match fetch_page(client, cursor, address).await? {
+            Some(page) => {
+                for node in page.nodes {
+                    let token = node.token;
+                    let image = match token.image {
+                        NftImage::Object { url, mime_type, .. } => Some((url, mime_type)),
+                        NftImage::Url(url) => Some((url, None)),
+                        NftImage::Null => None,
+                    };
+                    let (image_url, mime_type) = match image {
+                        Some((url, mime)) => (Some(url), mime),
+                        None => (None, None),
+                    };
+
+                    let collection_key = token.collection_name.clone().unwrap_or_default();
+                    let token_id = token.token_id.clone().unwrap_or_default();
+                    let id = format!("{collection_key}:{token_id}");
+                    let name = token
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("{collection_key} #{token_id}"));
+
+                    items.push(crate::collection::Item {
+                        id,
+                        name,
+                        collection_name: token.collection_name,
+                        image_url,
+                        mime_type,
+                        size_bytes: None,
+                    });
                 }
-            }
-            Ok(None) => None,
-            Err(err) => {
-                println!("Error fetching data: {}", err);
-                None
-            }
-        }
-    })
-    .flatten();
-    tokio::pin!(requests);
 
-    let mp = MultiProgress::new();
-    mp.set_alignment(indicatif::MultiProgressAlignment::Bottom);
-    let total_pb = mp.add(ProgressBar::new(0));
-    total_pb.set_style(
-        ProgressStyle::with_template("Found: {len:>3.bold.blue}  Saved: {pos:>3.bold.blue} {msg}")
-            .unwrap(),
-    );
-
-    let semaphore = Arc::new(Semaphore::new(max));
-    let mut errors: Vec<Report> = vec![];
-    let mut set = JoinSet::new();
-
-    while let Some(token) = requests.next().await {
-        total_pb.inc_length(1);
-        match handle_token(Arc::clone(&semaphore), token, &client, &mp, &path) {
-            Ok(Some(task)) => {
-                set.spawn(task);
+                if !page.page_info.has_next_page {
+                    break;
+                }
+                cursor = page.page_info.end_cursor;
             }
-            Ok(None) => total_pb.inc(1),
-            Err(err) => errors.push(err),
+            None => break,
         }
     }
 
-    while let Some(tasks) = set.join_next().await {
-        let tasks = tasks.unwrap();
-        match tasks.unwrap() {
-            Ok(_) => {
-                total_pb.inc(1);
-            }
-            Err(err) => {
-                errors.push(err);
-            }
-        }
-    }
-
-    if errors.is_empty() {
-        total_pb.finish_with_message("Completed all sucessfully");
-    } else {
-        total_pb.abandon();
-        errors.iter().for_each(|e| println!("{}", e))
-    }
-
-    Ok(())
+    Ok(items)
 }
 
-/// Save an already-fetched batch of tokens
-pub async fn save_tokens(
+/// Save a batch of already-selected items to disk. Returns a list of
+/// (item_id, file_name) for everything successfully saved or already present
+/// on disk, so the caller can update the collection manifest accordingly.
+/// Errors for individual items are printed but don't abort the batch.
+pub async fn save_items(
     client: &Client,
-    tokens: Vec<NftToken>,
+    items: Vec<(String, crate::collection::Item)>,
     path: PathBuf,
     max: usize,
-) -> eyre::Result<()> {
+) -> eyre::Result<Vec<(String, String)>> {
+    use crate::download::SaveOutcome;
+
     let mp = MultiProgress::new();
     mp.set_alignment(indicatif::MultiProgressAlignment::Bottom);
-    let total_pb = mp.add(ProgressBar::new(tokens.len() as u64));
+    let total_pb = mp.add(ProgressBar::new(items.len() as u64));
     total_pb.set_style(
         ProgressStyle::with_template("Found: {len:>3.bold.blue}  Saved: {pos:>3.bold.blue} {msg}")
             .unwrap(),
@@ -249,27 +234,36 @@ pub async fn save_tokens(
 
     let semaphore = Arc::new(Semaphore::new(max));
     let mut errors: Vec<Report> = vec![];
-    let mut set = JoinSet::new();
+    let mut saved: Vec<(String, String)> = vec![];
+    let mut set: JoinSet<(String, Result<String>)> = JoinSet::new();
 
-    for token in tokens {
-        match handle_token(Arc::clone(&semaphore), token, client, &mp, &path) {
-            Ok(Some(task)) => {
-                set.spawn(task);
+    for (id, item) in items {
+        match handle_token(Arc::clone(&semaphore), item, client, &mp, &path) {
+            Ok(SaveOutcome::AlreadySaved(file_name))
+            | Ok(SaveOutcome::SavedInstantly(file_name)) => {
+                total_pb.inc(1);
+                saved.push((id, file_name));
             }
-            Ok(None) => total_pb.inc(1),
+            Ok(SaveOutcome::Spawned(handle)) => {
+                set.spawn(async move {
+                    let result = handle
+                        .await
+                        .unwrap_or_else(|err| Err(eyre!("Download task panicked: {err}")));
+                    (id, result)
+                });
+            }
             Err(err) => errors.push(err),
         }
     }
 
-    while let Some(tasks) = set.join_next().await {
-        let tasks = tasks.unwrap();
-        match tasks.unwrap() {
-            Ok(_) => {
+    while let Some(res) = set.join_next().await {
+        let (id, result) = res.unwrap();
+        match result {
+            Ok(file_name) => {
                 total_pb.inc(1);
+                saved.push((id, file_name));
             }
-            Err(err) => {
-                errors.push(err);
-            }
+            Err(err) => errors.push(err),
         }
     }
 
@@ -280,5 +274,5 @@ pub async fn save_tokens(
         errors.iter().for_each(|e| println!("{}", e))
     }
 
-    Ok(())
+    Ok(saved)
 }

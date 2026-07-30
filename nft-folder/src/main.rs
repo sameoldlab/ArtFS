@@ -1,17 +1,19 @@
 mod alchemy;
 mod chain;
+mod collection;
 mod download;
-mod request;
 mod tzkt;
+mod zora;
 
 use chain::Chain;
-use download::create_directory;
-use request::{handle_processing, save_tokens};
+use collection::CollectionState;
+use download::{create_directory, save_items};
 
 use ::core::time::Duration;
 use alloy::{ens::ProviderEnsExt, providers::ProviderBuilder};
 use clap::{Args, Parser, Subcommand};
 use console::style;
+use dialoguer::{theme::ColorfulTheme, MultiSelect};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
@@ -27,13 +29,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create a folder for the provided address
+    /// Sync a collection: list what's available, let you pick what to keep,
+    /// and save the selection to disk. Safe to re-run — only new or
+    /// unselected items require your attention, and already-saved files are
+    /// never re-downloaded.
     Sync(SyncArgs),
 }
 
 #[derive(Args)]
 struct SyncArgs {
-    /// Address as ENS/Tezos name, hex (0x1Bca23...), or Tezos address (tz1.../KT1...)
+    /// Account or collection address
     address: String,
 
     /// directory to create nft folder
@@ -52,16 +57,24 @@ struct SyncArgs {
     #[arg(long)]
     chain: Option<Chain>,
 
-    /// Data source for EVM chains. "zora" uses Zora's public GraphQL API
-    /// (no key needed, Ethereum mainnet only). "alchemy" uses the Alchemy
-    /// NFT API and requires --api-key or ALCHEMY_API_KEY. Ignored for Tezos.
-    #[arg(long, default_value = "zora")]
+    /// Data source for EVM chains. Options: zora, alchemy, opensea. Defaults to opense
+    #[arg(long, default_value = "opensea")]
     source: EvmSource,
 
-    /// API key for the selected source (currently only needed for Alchemy).
-    /// Falls back to the ALCHEMY_API_KEY environment variable if not given.
+    /// API key for the selected source.
+    /// Reads ALCHEMY_API_KEY, OPENSEA_API_KEY, HELIUS_API_KEY if not given.
     #[arg(long)]
     api_key: Option<String>,
+
+    /// Skip the interactive picker and select every listed item (previously
+    /// selected + newly discovered).
+    #[arg(long)]
+    all: bool,
+
+    /// Skip the interactive picker and keep the current selection as-is
+    /// Useful on a re-sync; on a first sync this selects nothing).
+    #[arg(long, conflicts_with = "all")]
+    no_prompt: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -90,7 +103,7 @@ async fn main() -> Result<()> {
                         || args.address.starts_with("tz3")
                         || args.address.starts_with("KT1"))
                     {
-                      // TODO: Tezos names?
+                        // TODO: Tezos names?
                         return Err(eyre::eyre!(
                             "{} Tezos addresses must start with tz1, tz2, tz3, or KT1",
                             style("Invalid address").red()
@@ -105,7 +118,8 @@ async fn main() -> Result<()> {
                     arg if arg.split(".").last().unwrap() == "eth" => {
                         let spinner =
                             pending(&multi_pb, "ENS Detected. Resolving address...".to_string());
-                        let address = resolve_ens_name(arg, &args.rpc.clone()).await?;
+                        let provider = ProviderBuilder::new().connect_http(args.rpc.parse()?);
+                        let address = provider.resolve_name(arg).await?.to_string();
                         spinner.finish_with_message(format!("Name Resolved to {address}"));
                         Account {
                             name: Some(arg.to_string()),
@@ -137,10 +151,7 @@ async fn main() -> Result<()> {
                 None => path.join(&account.address),
             };
 
-            let spinner = pending(
-                &multi_pb,
-                format!("Saving files to {}", path.to_string_lossy()),
-            );
+            let spinner = pending(&multi_pb, format!("Setting up {}", path.to_string_lossy()));
             path = match create_directory(path).await {
                 Ok(path) => {
                     spinner.finish();
@@ -151,17 +162,24 @@ async fn main() -> Result<()> {
 
             let client = Client::new();
 
-            match chain {
+            let source_label = match chain {
                 Chain::Ethereum => match args.source {
-                    EvmSource::Zora => {
-                        handle_processing(
-                            &client,
-                            account.address.as_str(),
-                            path,
-                            args.max_concurrent_downloads,
-                        )
-                        .await?;
-                    }
+                    EvmSource::Zora => "zora",
+                    EvmSource::Alchemy => "alchemy",
+                },
+                Chain::Tezos => "tzkt",
+            };
+
+            let mut state =
+                CollectionState::load_or_new(&path, &account.address, Some(chain), source_label)?;
+
+            let spinner = pending(
+                &multi_pb,
+                format!("Fetching item list from {source_label}..."),
+            );
+            let listed: Vec<collection::Item> = match chain {
+                Chain::Ethereum => match args.source {
+                    EvmSource::Zora => zora::list_items(&client, &account.address).await?,
                     EvmSource::Alchemy => {
                         let api_key = args
                             .api_key
@@ -172,37 +190,118 @@ async fn main() -> Result<()> {
                                     style("Missing API key").red()
                                 )
                             })?;
-
-                        let spinner =
-                            pending(&multi_pb, "Fetching NFTs from Alchemy...".to_string());
-                        let tokens =
-                            alchemy::fetch_all(&client, &api_key, &account.address).await?;
-                        spinner.finish_with_message(format!("Found {} NFTs", tokens.len()));
-
-                        save_tokens(&client, tokens, path, args.max_concurrent_downloads).await?;
+                        alchemy::list_items(&client, &api_key, &account.address).await?
                     }
                 },
-                Chain::Tezos => {
-                    let spinner = pending(&multi_pb, "Fetching NFTs from TzKT...".to_string());
-                    let tokens = tzkt::fetch_all(&client, &account.address).await?;
-                    spinner.finish_with_message(format!("Found {} NFTs", tokens.len()));
+                Chain::Tezos => tzkt::list_items(&client, &account.address).await?,
+            };
+            spinner.finish_with_message(format!("Found {} items", listed.len()));
 
-                    save_tokens(&client, tokens, path, args.max_concurrent_downloads).await?;
+            let new_ids = state.merge_listed(listed);
+            if !new_ids.is_empty() {
+                println!(
+                    "{} {} new item(s) since last sync",
+                    style("+").green(),
+                    new_ids.len()
+                );
+            }
+
+            if args.all {
+                let all_ids: Vec<String> = state.items.keys().cloned().collect();
+                state.set_selected(&all_ids);
+            } else if !args.no_prompt {
+                // Sort for a stable, readable prompt order.
+                let mut entries: Vec<(&String, &collection::ItemState)> =
+                    state.items.iter().collect();
+                entries.sort_by(|a, b| a.1.item.name.cmp(&b.1.item.name));
+
+                let labels: Vec<String> = entries
+                    .iter()
+                    .map(|(_, s)| {
+                        let size = s
+                            .item
+                            .size_bytes
+                            .map(|b| human_size(b))
+                            .unwrap_or_else(|| "?".to_string());
+                        let flag = if s.downloaded {
+                            " [saved]"
+                        } else if new_ids.contains(&s.item.id) {
+                            " [new]"
+                        } else {
+                            ""
+                        };
+                        format!("{} ({size}){flag}", s.item.name)
+                    })
+                    .collect();
+
+                // Default-check anything already selected, plus anything new,
+                // but leave previously-deselected old items alone
+                let defaults: Vec<bool> = entries
+                    .iter()
+                    .map(|(id, s)| s.selected || new_ids.contains(*id))
+                    .collect();
+
+                if !entries.is_empty() {
+                    let selection = MultiSelect::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Select items to save (space to toggle, enter to confirm)")
+                        .items(&labels)
+                        .defaults(&defaults)
+                        .interact()?;
+
+                    let selected_ids: Vec<String> = selection
+                        .into_iter()
+                        .map(|i| entries[i].0.clone())
+                        .collect();
+                    state.set_selected(&selected_ids);
                 }
             }
+            // args.no_prompt: keep selection as currently persisted, untouched.
+
+            let pending_items: Vec<(String, collection::Item)> = state
+                .pending()
+                .into_iter()
+                .map(|s| (s.item.id.clone(), s.item.clone()))
+                .collect();
+
+            if pending_items.is_empty() {
+                println!("Nothing new to save.");
+            } else {
+                let saved = save_items(
+                    &client,
+                    pending_items,
+                    path.clone(),
+                    args.max_concurrent_downloads,
+                )
+                .await?;
+                for (id, file_name) in saved {
+                    state.mark_downloaded(&id, file_name);
+                }
+            }
+
+            state.touch_synced();
+            state.save(&path)?;
 
             Ok(())
         }
     }
 }
 
-async fn resolve_ens_name(ens_name: &str, rpc_url: &str) -> Result<String> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let address = provider.resolve_name(ens_name).await?;
-    Ok(address.to_string())
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}{}", UNITS[unit])
+    } else {
+        format!("{size:.1}{}", UNITS[unit])
+    }
 }
 
-/// Wrapsa generic action with a spinner then return it's result
+/// Wraps a generic action with a spinner then return it's result
 fn pending(multi_pb: &MultiProgress, msg: String) -> ProgressBar {
     // https://github.com/sindresorhus/cli-spinners/blob/main/spinners.json
     let style = ProgressStyle::default_spinner()

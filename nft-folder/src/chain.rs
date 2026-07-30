@@ -1,35 +1,63 @@
 use std::fmt;
 
-use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+use crate::Source;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Chain {
-    Ethereum,
+    Mainnet,
     Tezos,
     Solana,
+    Arbitrum,
+    Base,
+    Zora,
+    Optimism,
+    // Dynamic(String)
 }
 
 impl fmt::Display for Chain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Chain::Ethereum => write!(f, "ethereum"),
+            Chain::Mainnet => write!(f, "ethereum"),
             Chain::Tezos => write!(f, "tezos"),
             Chain::Solana => write!(f, "solana"),
+            Chain::Arbitrum => write!(f, "arbitrum"),
+            Chain::Base => write!(f, "base"),
+            Chain::Zora => write!(f, "zora"),
+            Chain::Optimism => write!(f, "optimism"),
         }
     }
 }
 
 impl Chain {
-    pub fn detect(address: &str) -> Chain {
+    pub fn detect(address: &str, chain: &str) -> Chain {
         if is_tezos(&address) {
             Chain::Tezos
         } else if is_evm(&address) {
-            Chain::Ethereum
+            match chain {
+              "mainnet" => Chain::Mainnet,
+              "ethereum" => Chain::Mainnet,
+              "arbitrum" => Chain::Arbitrum,
+              "optimism" => Chain::Optimism,
+              "base" => Chain::Base,
+              "zora" => Chain::Zora,
+              "arb" => Chain::Arbitrum,
+              "opt" => Chain::Optimism,
+              "eth" => Chain::Mainnet,
+              _ => Chain::Mainnet,
+            }
         } else if is_solana(&address) {
             Chain::Solana
         } else {
-            Chain::Ethereum
+            Chain::Mainnet
+        }
+    }
+    pub fn default_source(&self) -> Source {
+        match self {
+            Chain::Solana => Source::Helius,
+            Chain::Tezos => Source::Tzkt,
+            _ => Source::Opensea,
         }
     }
 }

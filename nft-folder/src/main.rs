@@ -18,7 +18,7 @@ use dialoguer::{theme::ColorfulTheme, MultiSelect};
 use eyre::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -56,11 +56,11 @@ struct SyncArgs {
 
     /// Which network to pull from. Auto-detected from the address format if not given
     #[arg(long)]
-    chain: Option<Chain>,
+    chain: Option<String>,
 
     /// Data source for EVM chains. Options: alchemy, opensea. Defaults to opensea
-    #[arg(long, default_value = "opensea")]
-    source: EvmSource,
+    #[arg(long)]
+    source: Option<Source>,
 
     /// API key for the selected source.
     /// Reads ALCHEMY_API_KEY, OPENSEA_API_KEY, HELIUS_API_KEY if not given.
@@ -79,9 +79,21 @@ struct SyncArgs {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum EvmSource {
+enum Source {
     Alchemy,
-    OpenSea,
+    Tzkt,
+    Opensea,
+    Helius,
+}
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Source::Alchemy => write!(f, "alchemy"),
+            Source::Tzkt => write!(f, "tzkt"),
+            Source::Opensea => write!(f, "opensea"),
+            Source::Helius => write!(f, "helius"),
+        }
+    }
 }
 
 struct Account {
@@ -95,64 +107,28 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Sync(args) => {
             let multi_pb = MultiProgress::new();
-            let chain = args.chain.unwrap_or_else(|| Chain::detect(&args.address));
+            let chain = Chain::detect(&args.address, &args.chain.unwrap_or("mainnet".to_string()));
+            let source = args.source.unwrap_or_else(|| chain.default_source());
 
-            let account = match chain {
-                Chain::Tezos => {
-                    if !chain::is_tezos(&args.address) {
-                        // TODO: Tezos names?
-                        return Err(eyre::eyre!(
-                            "{} Tezos addresses must start with tz1, tz2, tz3, or KT1",
-                            style("Invalid address").red()
-                        ));
-                    }
-                    if args.address.ends_with(".tez") {
-                        return Err(eyre::eyre!("Tezos names are not yet supported"));
-                    }
-                    Account {
-                        name: None,
-                        address: args.address,
-                    }
+						let account =  if args.address.ends_with(".eth") {
+                  let spinner =
+                      pending(&multi_pb, "ENS Detected. Resolving address...".to_string());
+                  let provider = ProviderBuilder::new().connect_http(args.rpc.parse()?);
+                  let address = provider.resolve_name(&args.address).await?.to_string();
+                  spinner.finish_with_message(format!("Name Resolved to {address}"));
+                  Account {
+                      name: Some(args.address.to_string()),
+                      address,
+                  }
+              } else if args.address.ends_with(".tez") || args.address.ends_with(".sol") {
+                return Err(eyre::eyre!("Name service not yet supported on this network"));
+              }
+              else {
+                Account {
+                    name: None,
+                    address: args.address,
                 }
-                Chain::Ethereum => match args.address.as_str() {
-                    arg if arg.split(".").last().unwrap() == "eth" => {
-                        let spinner =
-                            pending(&multi_pb, "ENS Detected. Resolving address...".to_string());
-                        let provider = ProviderBuilder::new().connect_http(args.rpc.parse()?);
-                        let address = provider.resolve_name(arg).await?.to_string();
-                        spinner.finish_with_message(format!("Name Resolved to {address}"));
-                        Account {
-                            name: Some(arg.to_string()),
-                            address,
-                        }
-                    }
-                    arg if arg.starts_with("0x") => Account {
-                        name: None,
-                        address: args.address,
-                    },
-                    _ => {
-                        return Err(eyre::eyre!(
-                            "{} Supported formats are 0xabc12... or name.eth",
-                            style("Invalid address").red()
-                        ))
-                    }
-                },
-                Chain::Solana => {
-                    if !chain::is_solana(&args.address) {
-                        return Err(eyre::eyre!(
-                            "{} Not a valid Solana address",
-                            style("Invalid address").red()
-                        ));
-                    }
-                    if args.address.ends_with(".sol") {
-                        return Err(eyre::eyre!("Solana Name Service is not yet supported"));
-                    }
-                    Account {
-                        name: None,
-                        address: args.address,
-                    }
-                }
-            };
+              };
 
             let mut path = args
                 .path
@@ -177,49 +153,41 @@ async fn main() -> Result<()> {
 
             let client = Client::new();
 
-            let source_label = match chain {
-                    EvmSource::Alchemy => "alchemy",
-                    EvmSource::OpenSea => "opensea",
-                },
-                Chain::Tezos => "tzkt",
-                Chain::Solana => "helius",
-            };
 
             let mut state =
-                CollectionState::load_or_new(&path, &account.address, Some(chain), source_label)?;
+                CollectionState::load_or_new(&path, &account.address, Some(chain), &source)?;
 
             let spinner = pending(
                 &multi_pb,
-                format!("Fetching item list from {source_label}..."),
+                format!("Fetching item list from {source} on {chain}..."),
             );
-            let listed: Vec<collection::Item> = match chain {
-                    EvmSource::Alchemy => {
-                        let api_key = args
-                            .api_key
-                            .or_else(|| std::env::var("ALCHEMY_API_KEY").ok())
-                            .ok_or_else(|| {
-                                eyre::eyre!(
-                                    "{} Pass --api-key or set ALCHEMY_API_KEY to use this source ",
-                                    style("Missing API key").red()
-                                )
-                            })?;
-                        alchemy::list_items(&client, &api_key, &account.address).await?
-                    }
-                    EvmSource::OpenSea => {
-                        let api_key = args
-                            .api_key
-                            .or_else(|| std::env::var("OPENSEA_API_KEY").ok())
-                            .ok_or_else(|| {
-                                eyre::eyre!(
-                                    "{} Pass --api-key or set OPENSEA_API_KEY to use this source",
-                                    style("Missing API key").red()
-                                )
-                            })?;
-                        opensea::list_items(&client, &api_key, &account.address).await?
-                    }
-                },
-                Chain::Tezos => tzkt::list_items(&client, &account.address).await?,
-                Chain::Solana => {
+            let listed: Vec<collection::Item> = match source {
+                Source::Alchemy => {
+                    let api_key = args
+                        .api_key
+                        .or_else(|| std::env::var("ALCHEMY_API_KEY").ok())
+                        .ok_or_else(|| {
+                            eyre::eyre!(
+                                "{} Pass --api-key or set ALCHEMY_API_KEY to use this source ",
+                                style("Missing API key").red()
+                            )
+                        })?;
+                    alchemy::list_items(&client, &api_key, &account.address).await?
+                }
+                Source::Opensea => {
+                    let api_key = args
+                        .api_key
+                        .or_else(|| std::env::var("OPENSEA_API_KEY").ok())
+                        .ok_or_else(|| {
+                            eyre::eyre!(
+                                "{} Pass --api-key or set OPENSEA_API_KEY to use this source",
+                                style("Missing API key").red()
+                            )
+                        })?;
+                    opensea::list_items(&client, &api_key, &account.address, &chain).await?
+                }
+                Source::Tzkt => tzkt::list_items(&client, &account.address).await?,
+                Source::Helius => {
                     let api_key = args
                         .api_key
                         .or_else(|| std::env::var("HELIUS_API_KEY").ok())

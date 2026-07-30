@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::chain::Chain;
+use crate::Source;
 
 /// A single NFT/item during listing, before any download happens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,7 +61,7 @@ impl CollectionState {
         folder: &Path,
         collection_id: &str,
         chain: Option<Chain>,
-        source: &str,
+        source: &Source,
     ) -> Result<Self> {
         let path = Self::state_path(folder);
         if path.is_file() {

@@ -2,7 +2,7 @@ use eyre::{eyre, Result};
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::collection::Item;
+use crate::{chain::Chain, collection::Item};
 
 const PAGE_LIMIT: u32 = 200;
 
@@ -27,13 +27,15 @@ struct OpenSeaNft {
 
 /// List every NFT owned by `address` via OpenSea's v2 API,
 /// Requires an OpenSea API key (`x-api-key` header)
-pub async fn list_items(client: &Client, api_key: &str, address: &str) -> Result<Vec<Item>> {
+pub async fn list_items(
+  client: &Client, api_key: &str, address: &str, chain: &Chain) -> Result<Vec<Item>> {
+    println!("chain: {chain}");
     let mut all = Vec::new();
     let mut cursor: Option<String> = None;
 
     loop {
         let mut url = format!(
-            "https://api.opensea.io/api/v2/chain/{CHAIN_SLUG}/account/{address}/nfts?limit={PAGE_LIMIT}"
+            "https://api.opensea.io/api/v2/chain/{chain}/account/{address}/nfts?limit={PAGE_LIMIT}"
         );
         if let Some(ref next) = cursor {
             url.push_str(&format!("&next={next}"));

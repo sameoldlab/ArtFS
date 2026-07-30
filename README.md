@@ -8,4 +8,4 @@ contains:
 - Right Click Mint
 
 ## Credits
-Inspired by [nft-folder-macos](https://folder.lil.org)
+Inspired by [nft-player](https://github.com/lil-org/nft-player)
